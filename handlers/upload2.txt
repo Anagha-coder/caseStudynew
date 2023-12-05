@@ -1,0 +1,180 @@
+package handlers
+
+import (
+	"casestudy/models"
+	"context"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"mime/multipart"
+	"net/http"
+
+	"time"
+
+	"cloud.google.com/go/firestore"
+	"cloud.google.com/go/storage"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gin-gonic/gin"
+	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
+)
+
+// const (
+// 	bucketName = "maxstoragebucketformanyusersoncloud" // Replace with your actual bucket name
+// )
+
+// UploadFileHandler handles file uploads.
+func UploadFileHandler(c *gin.Context) {
+	// Ensure the user is authenticated (you need to implement this logic)
+	user, err := getUserFromToken(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed"})
+		return
+	}
+
+	// Get the file from the request
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get file from request"})
+		return
+	}
+
+	objectName := fmt.Sprintf("user_%s/%s", user.Username, file.Filename)
+
+	// Call the uploadFile function
+	if err := uploadFile(c.Writer, bucketName, objectName, file); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to upload file: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully"})
+}
+
+// getUserFromToken retrieves user information from the JWT token
+func getUserFromToken(c *gin.Context) (*models.User, error) {
+	// Extract the token from the request headers
+	tokenString := c.GetHeader("Authorization")
+	if tokenString == "" {
+		return nil, fmt.Errorf("token not provided")
+	}
+
+	// Parse the token and extract the user information
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Read the secret key from the file
+		secretKey, err := readSecretKeyFromFile("./secretKey.txt")
+		if err != nil {
+			return nil, fmt.Errorf("error reading secret key: %v", err)
+		}
+
+		return []byte(secretKey), nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("token validation failed: %v", err)
+	}
+
+	// Check if the token is valid
+	if !token.Valid {
+		return nil, fmt.Errorf("invalid token")
+	}
+
+	// Extract claims from the token
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, fmt.Errorf("failed to extract claims from token")
+	}
+
+	// Extract user information from claims
+	username, ok := claims["username"].(string)
+	if !ok {
+		return nil, fmt.Errorf("username not found in token claims")
+	}
+
+	// Fetch user information based on the extracted username
+	user, err := getUserByUsername(username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user: %v", err)
+	}
+
+	return user, nil
+}
+
+// uploadFile uploads an object.
+func uploadFile(w io.Writer, bucket, object string, file *multipart.FileHeader) error {
+	ctx := context.Background()
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("storage.NewClient: %w", err)
+	}
+	defer client.Close()
+
+	// Open local file.
+	f, err := file.Open()
+	if err != nil {
+		return fmt.Errorf("file.Open: %w", err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*50)
+	defer cancel()
+
+	o := client.Bucket(bucket).Object(object)
+
+	wc := o.NewWriter(ctx)
+	if _, err = io.Copy(wc, f); err != nil {
+		return fmt.Errorf("io.Copy: %w", err)
+	}
+	if err := wc.Close(); err != nil {
+		return fmt.Errorf("Writer.Close: %w", err)
+	}
+
+	fmt.Fprintf(w, "Blob %v uploaded.\n", object)
+	return nil
+}
+
+// readSecretKeyFromFile reads the secret key from a file
+func readSecretKeyFromFile(filePath string) (string, error) {
+	// Read the secret key from the file
+	secretKey, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("error reading secret key from file: %v", err)
+	}
+
+	return string(secretKey), nil
+}
+
+// getUserByUsername retrieves user information based on the username
+func getUserByUsername(username string) (*models.User, error) {
+	ctx := context.Background()
+
+	// Set up Firestore client
+	firestoreClient, err := firestore.NewClient(ctx, projectID, option.WithCredentialsFile(credentialFile))
+	if err != nil {
+		log.Fatalf("Failed to create Firestore client: %v", err)
+	}
+	defer firestoreClient.Close()
+
+	iter := firestoreClient.Collection("users").Where("Username", "==", username).Limit(1).Documents(ctx)
+	defer iter.Stop()
+
+	for {
+		snapshot, err := iter.Next()
+		if err != nil {
+			if err == iterator.Done {
+				// Username not found
+				return nil, fmt.Errorf("user with username %s not found", username)
+			}
+			// Error while fetching the next document
+			return nil, fmt.Errorf("error fetching user: %v", err)
+		}
+
+		// Found a matching document, parse it into a User struct
+		var user models.User
+		if err := snapshot.DataTo(&user); err != nil {
+			return nil, fmt.Errorf("error parsing user data: %v", err)
+		}
+
+		return &user, nil
+	}
+}
